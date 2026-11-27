@@ -15,6 +15,10 @@ type Config struct {
 	Origins             map[string]struct{}
 	Mailer              mailer.Sender
 	VerificationBaseURL string
+	AdminUsername       string
+	AdminPassword       string
+	DeveloperUsername   string
+	DeveloperPassword   string
 }
 
 type config struct {
@@ -24,6 +28,10 @@ type config struct {
 	origins             map[string]struct{}
 	mailer              mailer.Sender
 	verificationBaseURL string
+	adminUsername       string
+	adminPassword       string
+	developerUsername   string
+	developerPassword   string
 }
 
 func New(db *pgxpool.Pool, cfg Config) *API {
@@ -34,6 +42,10 @@ func New(db *pgxpool.Pool, cfg Config) *API {
 		origins:             cfg.Origins,
 		mailer:              cfg.Mailer,
 		verificationBaseURL: cfg.VerificationBaseURL,
+		adminUsername:       cfg.AdminUsername,
+		adminPassword:       cfg.AdminPassword,
+		developerUsername:   cfg.DeveloperUsername,
+		developerPassword:   cfg.DeveloperPassword,
 	})
 }
 
@@ -42,5 +54,11 @@ func (a *API) Handler() http.Handler {
 }
 
 func newAPI(db *pgxpool.Pool, cfg config) *API {
-	return &API{db: db, cfg: cfg, httpClient: &http.Client{Timeout: 25 * time.Second}, rate: make(map[string][]time.Time)}
+	if cfg.adminUsername == "" {
+		cfg.adminUsername = "Ahmed"
+	}
+	return &API{
+		db: db, cfg: cfg, httpClient: &http.Client{Timeout: 25 * time.Second},
+		rate: make(map[string][]time.Time), startedAt: time.Now(),
+	}
 }

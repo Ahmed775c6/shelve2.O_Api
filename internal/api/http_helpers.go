@@ -2,12 +2,15 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func methodGate(method string, next http.Handler) http.Handler {
@@ -29,7 +32,7 @@ func (a *API) cors(next http.Handler) http.Handler {
 				w.Header().Set("Vary", "Origin")
 			}
 		}
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Admin-Password")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -74,8 +77,108 @@ func (a *API) auth(next http.Handler) http.Handler {
 			writeError(w, http.StatusUnauthorized, "unauthorized", "Invalid or expired bearer token")
 			return
 		}
-		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), userContextKey, owner)))
+		claims, err := verifySignedClaims(strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer")), a.cfg.jwtSecret, time.Now().UTC())
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "unauthorized", "Invalid or expired bearer token")
+			return
+		}
+		if a.db != nil {
+			var banned bool
+			var revokedAt *time.Time
+			err := a.db.QueryRow(r.Context(),
+				`SELECT banned_at IS NOT NULL,session_revoked_at FROM users WHERE id=$1`, owner).
+				Scan(&banned, &revokedAt)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					writeError(w, http.StatusUnauthorized, "unauthorized", "Account is unavailable")
+					return
+				}
+				writeError(w, http.StatusServiceUnavailable, "service_unavailable", "Could not verify account access")
+				return
+			}
+			if banned {
+				writeError(w, http.StatusForbidden, "account_banned", "This account has been suspended")
+				return
+			}
+			if revokedAt != nil && !revokedAt.Before(time.Unix(claims.Issued, 0)) {
+				writeError(w, http.StatusUnauthorized, "session_revoked", "This session is no longer valid")
+				return
+			}
+		}
+		platform := detectUserPlatform(r.UserAgent())
+		ctx := context.WithValue(r.Context(), userContextKey, owner)
+		recorder := &statusRecorder{ResponseWriter: w}
+		next.ServeHTTP(recorder, r.WithContext(ctx))
+		status := recorder.status
+		if status == 0 {
+			status = http.StatusOK
+		}
+		if a.db != nil {
+			a.recordUserActivity(r.Context(), owner, r.Method, r.URL.Path, status, platform)
+		}
 	})
+}
+
+type adminContextKey string
+
+const (
+	adminRoleContextKey adminContextKey = "adminRole"
+	adminNameContextKey adminContextKey = "adminName"
+)
+
+func (a *API) adminAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		authorization := r.Header.Get("Authorization")
+		if !strings.HasPrefix(authorization, "Bearer ") {
+			writeError(w, http.StatusUnauthorized, "admin_unauthorized", "An admin session is required")
+			return
+		}
+		claims, err := verifyAdminToken(strings.TrimSpace(strings.TrimPrefix(authorization, "Bearer")), a.cfg.jwtSecret, time.Now().UTC())
+		if err != nil {
+			writeError(w, http.StatusUnauthorized, "admin_unauthorized", "The admin session is invalid or expired")
+			return
+		}
+		ctx := context.WithValue(r.Context(), adminRoleContextKey, claims.Role)
+		ctx = context.WithValue(ctx, adminNameContextKey, claims.AdminName)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (a *API) adminReauth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost && r.Method != http.MethodPatch && r.Method != http.MethodDelete {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		valid, err := a.verifyAdminPassword(r, r.Header.Get("X-Admin-Password"))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "Could not verify admin password")
+			return
+		}
+		if !valid {
+			writeError(w, http.StatusUnauthorized, "admin_reauthentication_required", "Enter your current admin password to confirm this change")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func adminRoleFrom(r *http.Request) string {
+	role, _ := r.Context().Value(adminRoleContextKey).(string)
+	return role
+}
+
+func adminNameFrom(r *http.Request) string {
+	name, _ := r.Context().Value(adminNameContextKey).(string)
+	return name
+}
+
+func secureStringEqual(left, right string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(left), []byte(right)) == 1
 }
 
 func userIDFrom(r *http.Request) string {

@@ -13,14 +13,24 @@ import (
 )
 
 func (a *API) upload(w http.ResponseWriter, r *http.Request) {
-	r.Body = http.MaxBytesReader(w, r.Body, maxUpload+(1<<20))
 	reader, err := r.MultipartReader()
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_upload", "Upload exceeds the allowed size or is malformed")
+		writeError(w, http.StatusBadRequest, "invalid_upload", "Upload is malformed")
 		return
 	}
 	var kind, filenameSubmitted, uploadID string
-	var fileData []byte
+	var fileHead []byte
+	var fileSize int64
+	var tempPath string
+	var tempFile *os.File
+	defer func() {
+		if tempFile != nil {
+			_ = tempFile.Close()
+		}
+		if tempPath != "" {
+			_ = os.Remove(tempPath)
+		}
+	}()
 	fileFound := false
 	for {
 		part, nextErr := reader.NextPart()
@@ -28,7 +38,7 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if nextErr != nil {
-			writeError(w, http.StatusBadRequest, "invalid_upload", "Upload exceeds the allowed size or is malformed")
+			writeError(w, http.StatusBadRequest, "invalid_upload", "Upload is malformed")
 			return
 		}
 		switch part.FormName() {
@@ -56,38 +66,63 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 			}
 			fileFound = true
 			filenameSubmitted = part.FileName()
-			data, readErr := io.ReadAll(io.LimitReader(part, maxUpload+1))
-			_ = part.Close()
-			if readErr != nil {
+			if err := os.MkdirAll(a.cfg.uploadDir, 0o750); err != nil {
+				_ = part.Close()
+				writeError(w, http.StatusInternalServerError, "internal_error", "Could not store file")
+				return
+			}
+			tempFile, err = os.CreateTemp(a.cfg.uploadDir, ".upload-*")
+			if err != nil {
+				_ = part.Close()
+				writeError(w, http.StatusInternalServerError, "internal_error", "Could not store file")
+				return
+			}
+			tempPath = tempFile.Name()
+			fileHead = make([]byte, 512)
+			headLen, readErr := io.ReadFull(part, fileHead)
+			if readErr != nil && readErr != io.EOF && readErr != io.ErrUnexpectedEOF {
+				_ = part.Close()
 				writeError(w, http.StatusBadRequest, "invalid_upload", "Could not read uploaded file")
 				return
 			}
-			if len(data) > maxUpload {
-				writeError(w, http.StatusRequestEntityTooLarge, "file_too_large", "File must be no larger than 20 MiB")
+			fileHead = fileHead[:headLen]
+			written, writeErr := tempFile.Write(fileHead)
+			if writeErr != nil || written != headLen {
+				_ = part.Close()
+				writeError(w, http.StatusInternalServerError, "internal_error", "Could not store file")
 				return
 			}
-			fileData = data
+			fileSize = int64(written)
+			copied, copyErr := io.Copy(tempFile, part)
+			closeErr := part.Close()
+			if copyErr != nil || closeErr != nil {
+				writeError(w, http.StatusBadRequest, "invalid_upload", "Could not read uploaded file")
+				return
+			}
+			fileSize += copied
 		default:
 			_ = part.Close()
 			writeError(w, http.StatusBadRequest, "invalid_upload", "Unexpected multipart field")
 			return
 		}
 	}
-	if !fileFound || filenameSubmitted == "" || len(fileData) == 0 || !validUUID(uploadID) {
+	if !fileFound || filenameSubmitted == "" || fileSize == 0 || !validUUID(uploadID) {
 		writeError(w, http.StatusBadRequest, "invalid_upload", "A non-empty file and valid uploadId are required")
 		return
 	}
+	if err := tempFile.Close(); err != nil {
+		tempFile = nil
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not store file")
+		return
+	}
+	tempFile = nil
 	extension := strings.ToLower(filepath.Ext(filepath.Base(filenameSubmitted)))
 	if !validUploadType(kind, extension) {
 		writeError(w, http.StatusBadRequest, "invalid_upload", "Unsupported file type")
 		return
 	}
-	headLen := len(fileData)
-	if headLen > 512 {
-		headLen = 512
-	}
-	detected := http.DetectContentType(fileData[:headLen])
-	if !validDetectedType(extension, detected) && !(extension == ".mobi" && validMobi(fileData)) {
+	detected := http.DetectContentType(fileHead)
+	if !validDetectedType(extension, detected) && !(extension == ".mobi" && validMobi(fileHead)) {
 		writeError(w, http.StatusBadRequest, "invalid_upload", "File content does not match its extension")
 		return
 	}
@@ -120,17 +155,29 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_upload", "Invalid file path")
 		return
 	}
-	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
+	in, err := os.Open(tempPath)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "Could not store file")
 		return
 	}
-	size, writeErr := out.Write(fileData)
-	closeErr := out.Close()
-	if writeErr != nil || closeErr != nil || size != len(fileData) {
-		_ = os.Remove(path)
-		writeError(w, http.StatusBadRequest, "invalid_upload", "Could not store file")
+	out, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
+	if err != nil {
+		_ = in.Close()
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not store file")
 		return
+	}
+	size, writeErr := io.Copy(out, in)
+	inCloseErr := in.Close()
+	closeErr := out.Close()
+	if writeErr != nil || inCloseErr != nil || closeErr != nil || size != fileSize {
+		_ = os.Remove(path)
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not store file")
+		return
+	}
+	if err := os.Remove(tempPath); err != nil {
+		log.Printf("remove temporary upload file %q: %v", tempPath, err)
+	} else {
+		tempPath = ""
 	}
 	contentType := mime.TypeByExtension(extension)
 	if contentType == "" && extension == ".epub" {
@@ -144,7 +191,7 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 		 VALUES($1,$2,$3,$4,$5,$6,NOW())
 		 ON CONFLICT(owner_id,kind,upload_id) DO UPDATE SET
 		   filename=EXCLUDED.filename,content_type=EXCLUDED.content_type,size_bytes=EXCLUDED.size_bytes,created_at=NOW()`,
-		userIDFrom(r), filename, kind, uploadID, contentType, size)
+		userIDFrom(r), filename, kind, uploadID, contentType, fileSize)
 	if err != nil {
 		_ = os.Remove(path)
 		writeError(w, http.StatusInternalServerError, "internal_error", "Could not register file")
@@ -153,7 +200,7 @@ func (a *API) upload(w http.ResponseWriter, r *http.Request) {
 
 	writeJSON(w, http.StatusCreated, map[string]any{
 		"filename": filename, "type": kind, "url": "/api/files/" + kind + "/" + filename,
-		"size": size, "contentType": contentType,
+		"size": fileSize, "contentType": contentType,
 	})
 }
 

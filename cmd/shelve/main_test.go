@@ -9,6 +9,10 @@ import (
 
 func TestLoadConfigEmailDeliveryConfiguration(t *testing.T) {
 	t.Setenv("JWT_SECRET", strings.Repeat("x", 32))
+	t.Setenv("ADMIN_PASSWORD", "a-test-admin-password")
+	t.Setenv("ADMIN_USERNAME", "Ahmed")
+	t.Setenv("DEVELOPER_USERNAME", "")
+	t.Setenv("DEVELOPER_PASSWORD", "")
 	t.Setenv("PORT", "")
 	t.Setenv("CORS_ORIGINS", "")
 	t.Setenv("UPLOAD_DIR", "")

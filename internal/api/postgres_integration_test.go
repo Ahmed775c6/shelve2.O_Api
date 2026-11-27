@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type testEmail struct {
@@ -269,6 +270,28 @@ func TestPostgresIdempotentUploadRetry(t *testing.T) {
 	if err != nil || string(data) != "Shelve upload retry test.\n" {
 		t.Fatalf("idempotent upload content = %q, err=%v", data, err)
 	}
+
+	largeUploadID := newUUID()
+	var largeBody bytes.Buffer
+	largeWriter := multipart.NewWriter(&largeBody)
+	_ = largeWriter.WriteField("type", "books")
+	_ = largeWriter.WriteField("uploadId", largeUploadID)
+	largePart, err := largeWriter.CreateFormFile("file", "large.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.WriteString(largePart, strings.Repeat("x", (20<<20)+1))
+	if err := largeWriter.Close(); err != nil {
+		t.Fatal(err)
+	}
+	largeRequest := httptest.NewRequest(http.MethodPost, "/api/upload", &largeBody)
+	largeRequest.Header.Set("Authorization", "Bearer "+token)
+	largeRequest.Header.Set("Content-Type", largeWriter.FormDataContentType())
+	largeResponse := httptest.NewRecorder()
+	a.handler().ServeHTTP(largeResponse, largeRequest)
+	if largeResponse.Code != http.StatusCreated {
+		t.Fatalf("upload larger than 20 MiB status = %d: %s", largeResponse.Code, largeResponse.Body.String())
+	}
 }
 
 func TestPostgresExpiredJWTLeavesCloudDataIntact(t *testing.T) {
@@ -454,6 +477,7 @@ func TestPostgresEmailNotificationOptInAndDedupe(t *testing.T) {
 		`UPDATE users SET email_verified_at=NOW() WHERE id=$1`, owner); err != nil {
 		t.Fatal(err)
 	}
+
 	secret := []byte(strings.Repeat("n", 32))
 	token, err := signToken(owner, secret, time.Now().UTC())
 	if err != nil {
@@ -491,5 +515,216 @@ func TestPostgresEmailNotificationOptInAndDedupe(t *testing.T) {
 	}
 	if len(mailer.messages) != 1 {
 		t.Fatalf("opted-out user received %d emails", len(mailer.messages))
+	}
+}
+
+func TestPostgresPasswordResetTokenIsSingleUse(t *testing.T) {
+	pool := postgresTestPool(t)
+	owner := postgresTestOwner(t, pool)
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE users SET email_verified_at=NOW() WHERE id=$1`, owner); err != nil {
+		t.Fatal(err)
+	}
+	mailer := &recordingEmailSender{}
+	a := newAPI(pool, config{mailer: mailer, verificationBaseURL: "https://shelve.example/verify-email"})
+	var email string
+	if err := pool.QueryRow(context.Background(), `SELECT email FROM users WHERE id=$1`, owner).Scan(&email); err != nil {
+		t.Fatal(err)
+	}
+	requestBody, _ := json.Marshal(map[string]string{"email": email})
+	request := httptest.NewRecorder()
+	a.handler().ServeHTTP(request, httptest.NewRequest(http.MethodPost, "/api/auth/password/forgot", bytes.NewReader(requestBody)))
+	if request.Code != http.StatusAccepted || len(mailer.messages) != 1 {
+		t.Fatalf("password reset request status = %d, emails=%d: %s", request.Code, len(mailer.messages), request.Body.String())
+	}
+
+	token := verificationTokenFromEmail(t, mailer.messages[0])
+	resetBody, _ := json.Marshal(map[string]string{"token": token, "newPassword": "new-valid-password"})
+	reset := httptest.NewRecorder()
+	a.handler().ServeHTTP(reset, httptest.NewRequest(http.MethodPost, "/api/auth/password/reset", bytes.NewReader(resetBody)))
+	if reset.Code != http.StatusOK {
+		t.Fatalf("password reset status = %d: %s", reset.Code, reset.Body.String())
+	}
+	var passwordHash string
+	if err := pool.QueryRow(context.Background(), `SELECT password_hash FROM users WHERE id=$1`, owner).Scan(&passwordHash); err != nil {
+		t.Fatal(err)
+	}
+	if err := bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte("new-valid-password")); err != nil {
+		t.Fatalf("password was not updated: %v", err)
+	}
+	reuse := httptest.NewRecorder()
+	a.handler().ServeHTTP(reuse, httptest.NewRequest(http.MethodPost, "/api/auth/password/reset", bytes.NewReader(resetBody)))
+	if reuse.Code != http.StatusBadRequest {
+		t.Fatalf("reused password reset token status = %d, want %d", reuse.Code, http.StatusBadRequest)
+	}
+}
+
+func TestPostgresReplaceCloudDataRequiresPasswordAndReplacesRecords(t *testing.T) {
+	pool := postgresTestPool(t)
+	owner := postgresTestOwner(t, pool)
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte("correct-password"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE users SET password_hash=$1 WHERE id=$2`, string(passwordHash), owner); err != nil {
+		t.Fatal(err)
+	}
+	secret := []byte(strings.Repeat("r", 32))
+	token, err := signToken(owner, secret, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newAPI(pool, config{jwtSecret: secret})
+	oldID := newUUID()
+	if _, err := a.mergeRecord(context.Background(), owner, "books", testBookRecord(oldID, "Old cloud book", time.Now().UTC())); err != nil {
+		t.Fatal(err)
+	}
+	newID := newUUID()
+	now := time.Now().UTC().Truncate(time.Millisecond)
+	payload := map[string]any{
+		"books":    []any{testBookRecord(newID, "Local source book", now)},
+		"progress": []any{}, "notes": []any{}, "readingSessions": []any{},
+		"readingPlans": []any{}, "writings": []any{}, "writingSessions": []any{},
+	}
+	call := func(password string) *httptest.ResponseRecorder {
+		t.Helper()
+		body, _ := json.Marshal(map[string]any{"password": password, "data": payload})
+		request := httptest.NewRequest(http.MethodPost, "/api/sync/replace", bytes.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		a.handler().ServeHTTP(response, request)
+		return response
+	}
+	if response := call("wrong-password"); response.Code != http.StatusUnauthorized {
+		t.Fatalf("replacement with wrong password status = %d: %s", response.Code, response.Body.String())
+	}
+	var oldCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM records WHERE owner_id=$1 AND id=$2`, owner, oldID).Scan(&oldCount); err != nil {
+		t.Fatal(err)
+	}
+	if oldCount != 1 {
+		t.Fatalf("wrong password changed existing cloud data: old record count = %d", oldCount)
+	}
+	if response := call("correct-password"); response.Code != http.StatusOK {
+		t.Fatalf("replacement status = %d: %s", response.Code, response.Body.String())
+	}
+	var newCount int
+	if err := pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM records WHERE owner_id=$1 AND id=$2`, owner, oldID).Scan(&oldCount); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM records WHERE owner_id=$1 AND id=$2`, owner, newID).Scan(&newCount); err != nil {
+		t.Fatal(err)
+	}
+	if oldCount != 0 || newCount != 1 {
+		t.Fatalf("replacement records: old=%d, new=%d", oldCount, newCount)
+	}
+}
+
+func TestPostgresPasswordVerification(t *testing.T) {
+	pool := postgresTestPool(t)
+	owner := postgresTestOwner(t, pool)
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte("correct-password"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(), `UPDATE users SET password_hash=$1 WHERE id=$2`, string(passwordHash), owner); err != nil {
+		t.Fatal(err)
+	}
+	secret := []byte(strings.Repeat("v", 32))
+	token, err := signToken(owner, secret, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := newAPI(pool, config{jwtSecret: secret})
+	verify := func(password string) *httptest.ResponseRecorder {
+		t.Helper()
+		body, _ := json.Marshal(map[string]string{"password": password})
+		request := httptest.NewRequest(http.MethodPost, "/api/auth/password/verify", bytes.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		a.handler().ServeHTTP(response, request)
+		return response
+	}
+	if response := verify("wrong-password"); response.Code != http.StatusUnauthorized {
+		t.Fatalf("wrong password status = %d, want %d", response.Code, http.StatusUnauthorized)
+	}
+	if response := verify("correct-password"); response.Code != http.StatusOK {
+		t.Fatalf("correct password status = %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestPostgresSignInSessionPreferenceAndProfileUpdate(t *testing.T) {
+	pool := postgresTestPool(t)
+	owner := postgresTestOwner(t, pool)
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte("correct-password"), bcrypt.MinCost)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(context.Background(),
+		`UPDATE users SET password_hash=$1 WHERE id=$2`, string(passwordHash), owner); err != nil {
+		t.Fatal(err)
+	}
+	secret := []byte(strings.Repeat("p", 32))
+	a := newAPI(pool, config{jwtSecret: secret})
+	var email string
+	if err := pool.QueryRow(context.Background(), `SELECT email FROM users WHERE id=$1`, owner).Scan(&email); err != nil {
+		t.Fatal(err)
+	}
+	signinBody, _ := json.Marshal(map[string]any{
+		"email": email, "password": "correct-password", "rememberMe": true,
+	})
+	signin := httptest.NewRecorder()
+	a.handler().ServeHTTP(signin, httptest.NewRequest(http.MethodPost, "/api/auth/signin", bytes.NewReader(signinBody)))
+	if signin.Code != http.StatusOK {
+		t.Fatalf("remembered sign-in status = %d: %s", signin.Code, signin.Body.String())
+	}
+	var rememberedSession struct {
+		Token      string    `json:"token"`
+		ExpiresAt  time.Time `json:"expiresAt"`
+		RememberMe bool      `json:"rememberMe"`
+	}
+	if err := json.Unmarshal(signin.Body.Bytes(), &rememberedSession); err != nil {
+		t.Fatal(err)
+	}
+	if !rememberedSession.RememberMe || time.Until(rememberedSession.ExpiresAt) < rememberedTokenLifetime-time.Minute {
+		t.Fatalf("remembered session has an unexpected expiry: %+v", rememberedSession)
+	}
+	if _, err := verifyToken(rememberedSession.Token, secret, time.Now().UTC().Add(25*time.Hour)); err != nil {
+		t.Fatalf("remembered token did not last beyond 24 hours: %v", err)
+	}
+
+	updateBody, _ := json.Marshal(map[string]any{"password": "correct-password", "rememberMe": false})
+	update := httptest.NewRecorder()
+	updateRequest := httptest.NewRequest(http.MethodPatch, "/api/auth/session", bytes.NewReader(updateBody))
+	updateRequest.Header.Set("Authorization", "Bearer "+rememberedSession.Token)
+	a.handler().ServeHTTP(update, updateRequest)
+	if update.Code != http.StatusOK {
+		t.Fatalf("session preference update status = %d: %s", update.Code, update.Body.String())
+	}
+	var regularSession struct {
+		Token      string    `json:"token"`
+		ExpiresAt  time.Time `json:"expiresAt"`
+		RememberMe bool      `json:"rememberMe"`
+	}
+	if err := json.Unmarshal(update.Body.Bytes(), &regularSession); err != nil {
+		t.Fatal(err)
+	}
+	if regularSession.RememberMe || time.Until(regularSession.ExpiresAt) < tokenLifetime-time.Minute {
+		t.Fatalf("regular session has an unexpected expiry: %+v", regularSession)
+	}
+	if _, err := verifyToken(regularSession.Token, secret, time.Now().UTC().Add(25*time.Hour)); err == nil {
+		t.Fatal("regular token should expire before 25 hours")
+	}
+
+	profileBody, _ := json.Marshal(map[string]string{"name": "Updated Name", "password": "correct-password"})
+	profile := httptest.NewRecorder()
+	profileRequest := httptest.NewRequest(http.MethodPatch, "/api/auth/profile", bytes.NewReader(profileBody))
+	profileRequest.Header.Set("Authorization", "Bearer "+regularSession.Token)
+	a.handler().ServeHTTP(profile, profileRequest)
+	if profile.Code != http.StatusOK || !strings.Contains(profile.Body.String(), `"name":"Updated Name"`) {
+		t.Fatalf("profile update status = %d: %s", profile.Code, profile.Body.String())
 	}
 }
