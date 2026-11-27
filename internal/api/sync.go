@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/crypto/bcrypt"
 	"log"
 	"net/http"
 	"time"
@@ -65,6 +66,178 @@ func (a *API) importJSON(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"results": counts})
+}
+
+func (a *API) replaceAllData(w http.ResponseWriter, r *http.Request) {
+	var input struct {
+		Password string         `json:"password"`
+		Data     map[string]any `json:"data"`
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	if input.Password == "" || input.Data == nil {
+		writeError(w, http.StatusBadRequest, "invalid_replacement", "Password and replacement data are required")
+		return
+	}
+
+	type replacementRecord struct {
+		collection string
+		id         string
+		data       []byte
+		updatedAt  time.Time
+		deletedAt  *time.Time
+	}
+	records := make([]replacementRecord, 0)
+	activeBooks := make(map[string]struct{})
+	seen := make(map[string]struct{})
+	for _, resource := range syncResourceOrder {
+		collection := syncResources[resource]
+		items, ok := input.Data[resource].([]any)
+		if !ok || len(items) > 1000 {
+			writeError(w, http.StatusBadRequest, "invalid_replacement", resource+" must be an array of at most 1000 records")
+			return
+		}
+		for _, item := range items {
+			record, ok := item.(map[string]any)
+			if !ok {
+				writeError(w, http.StatusBadRequest, "invalid_replacement", "Every replacement record must be an object")
+				return
+			}
+			if err := validateDocument(record); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_replacement", err.Error())
+				return
+			}
+			if err := validateRequiredFields(collection, record); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_replacement", err.Error())
+				return
+			}
+			id, ok := record["id"].(string)
+			if !ok || !validUUID(id) {
+				writeError(w, http.StatusBadRequest, "invalid_replacement", "Every replacement record must have a valid UUID id")
+				return
+			}
+			key := id
+			if collection == "progress" {
+				if bookID, ok := record["bookId"].(string); ok && bookID != "" {
+					key = bookID
+				}
+			}
+			if !validUUID(key) {
+				writeError(w, http.StatusBadRequest, "invalid_replacement", "A replacement record references an invalid id")
+				return
+			}
+			uniqueKey := collection + "\x00" + key
+			if _, duplicate := seen[uniqueKey]; duplicate {
+				writeError(w, http.StatusBadRequest, "invalid_replacement", "Replacement data contains duplicate records")
+				return
+			}
+			seen[uniqueKey] = struct{}{}
+			updatedAt, err := parseTimestamp(record["updatedAt"])
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_replacement", "Every replacement record must have a valid updatedAt timestamp")
+				return
+			}
+			deletedAt := parseDeletedAt(record)
+			if rawDeleted, exists := record["deletedAt"]; exists && rawDeleted != nil && deletedAt == nil {
+				writeError(w, http.StatusBadRequest, "invalid_replacement", "deletedAt must be an RFC3339 timestamp")
+				return
+			}
+			raw, err := json.Marshal(record)
+			if err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_replacement", "Could not encode replacement record")
+				return
+			}
+			records = append(records, replacementRecord{
+				collection: collection, id: key, data: raw, updatedAt: updatedAt, deletedAt: deletedAt,
+			})
+			if collection == "books" && deletedAt == nil {
+				activeBooks[id] = struct{}{}
+			}
+		}
+	}
+	for _, record := range records {
+		if record.deletedAt != nil {
+			continue
+		}
+		var bookID string
+		switch record.collection {
+		case "notes", "readingSessions", "progress":
+			var data map[string]any
+			if err := json.Unmarshal(record.data, &data); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_replacement", "Could not decode replacement record")
+				return
+			}
+			bookID, _ = data["bookId"].(string)
+			if bookID == "" && record.collection == "progress" {
+				bookID = record.id
+			}
+		case "readingPlans":
+			var data map[string]any
+			if err := json.Unmarshal(record.data, &data); err != nil {
+				writeError(w, http.StatusBadRequest, "invalid_replacement", "Could not decode replacement record")
+				return
+			}
+			bookIDs, _ := data["bookIds"].([]any)
+			for _, value := range bookIDs {
+				id, ok := value.(string)
+				if !ok {
+					writeError(w, http.StatusBadRequest, "invalid_replacement", "Reading plans may only reference books in the replacement data")
+					return
+				}
+				if _, exists := activeBooks[id]; !exists {
+					writeError(w, http.StatusBadRequest, "invalid_replacement", "Reading plans may only reference books in the replacement data")
+					return
+				}
+			}
+		}
+		if bookID != "" {
+			if _, exists := activeBooks[bookID]; !exists {
+				writeError(w, http.StatusBadRequest, "invalid_replacement", "Records may only reference books in the replacement data")
+				return
+			}
+		}
+	}
+
+	tx, err := a.db.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not replace cloud data")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	var passwordHash string
+	err = tx.QueryRow(r.Context(),
+		`SELECT password_hash FROM users WHERE id=$1 FOR UPDATE`, userIDFrom(r)).Scan(&passwordHash)
+	if errors.Is(err, pgx.ErrNoRows) || (err == nil && bcrypt.CompareHashAndPassword([]byte(passwordHash), []byte(input.Password)) != nil) {
+		writeError(w, http.StatusUnauthorized, "invalid_credentials", "Password is incorrect")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not verify account password")
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `DELETE FROM sync_conflicts WHERE owner_id=$1`, userIDFrom(r)); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not clear cloud sync conflicts")
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `DELETE FROM records WHERE owner_id=$1`, userIDFrom(r)); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not clear cloud records")
+		return
+	}
+	for _, record := range records {
+		if _, err := tx.Exec(r.Context(),
+			`INSERT INTO records(owner_id,collection,id,data,updated_at,deleted_at)
+			 VALUES($1,$2,$3,$4,$5,$6)`,
+			userIDFrom(r), record.collection, record.id, record.data, record.updatedAt, record.deletedAt); err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "Could not save replacement cloud data")
+			return
+		}
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not commit replacement cloud data")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"replaced": true, "records": len(records)})
 }
 
 func (a *API) pull(w http.ResponseWriter, r *http.Request) {

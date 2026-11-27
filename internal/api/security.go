@@ -31,26 +31,56 @@ func validUUID(value string) bool {
 }
 
 type jwtClaims struct {
-	Subject string `json:"sub"`
-	Issuer  string `json:"iss"`
-	Issued  int64  `json:"iat"`
-	Expires int64  `json:"exp"`
+	Subject    string `json:"sub"`
+	Issuer     string `json:"iss"`
+	Issued     int64  `json:"iat"`
+	Expires    int64  `json:"exp"`
+	RememberMe bool   `json:"rememberMe,omitempty"`
+	Role       string `json:"role,omitempty"`
+	AdminName  string `json:"adminName,omitempty"`
 }
 
 func signToken(subject string, secret []byte, now time.Time) (string, error) {
+	return signTokenWithLifetime(subject, secret, now, tokenLifetime, false)
+}
+
+func signSessionToken(subject string, secret []byte, now time.Time, rememberMe bool) (string, error) {
+	lifetime := tokenLifetime
+	if rememberMe {
+		lifetime = rememberedTokenLifetime
+	}
+	return signTokenWithLifetime(subject, secret, now, lifetime, rememberMe)
+}
+
+func signTokenWithLifetime(subject string, secret []byte, now time.Time, lifetime time.Duration, rememberMe bool) (string, error) {
 	if !validUUID(subject) || len(secret) < 32 {
 		return "", errors.New("invalid token subject or signing secret")
 	}
+	return signClaims(jwtClaims{
+		Subject:    subject,
+		Issuer:     tokenIssuer,
+		Issued:     now.Unix(),
+		Expires:    now.Add(lifetime).Unix(),
+		RememberMe: rememberMe,
+	}, secret)
+}
+
+func signAdminToken(username, role string, secret []byte, now time.Time) (string, error) {
+	if (role != "admin" && role != "developer") || strings.TrimSpace(username) == "" || len(secret) < 32 {
+		return "", errors.New("invalid admin token claims")
+	}
+	return signClaims(jwtClaims{
+		Subject: newUUID(), Issuer: tokenIssuer, Issued: now.Unix(),
+		Expires: now.Add(adminTokenLifetime).Unix(), Role: role, AdminName: username,
+	}, secret)
+}
+
+func signClaims(tokenClaims jwtClaims, secret []byte) (string, error) {
 	header, err := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT"})
 	if err != nil {
 		return "", err
 	}
-	claims, err := json.Marshal(jwtClaims{
-		Subject: subject,
-		Issuer:  tokenIssuer,
-		Issued:  now.Unix(),
-		Expires: now.Add(tokenLifetime).Unix(),
-	})
+	claims, err := json.Marshal(tokenClaims)
 	if err != nil {
 		return "", err
 	}
@@ -61,42 +91,72 @@ func signToken(subject string, secret []byte, now time.Time) (string, error) {
 }
 
 func verifyToken(token string, secret []byte, now time.Time) (string, error) {
+	claims, err := verifySignedClaims(token, secret, now)
+	if err != nil || claims.Role != "" || !validUUID(claims.Subject) {
+		return "", errors.New("invalid or expired token")
+	}
+	return claims.Subject, nil
+}
+
+func verifyAdminToken(token string, secret []byte, now time.Time) (jwtClaims, error) {
+	claims, err := verifySignedClaims(token, secret, now)
+	if err != nil || !validUUID(claims.Subject) ||
+		(claims.Role != "admin" && claims.Role != "developer") || strings.TrimSpace(claims.AdminName) == "" {
+		return jwtClaims{}, errors.New("invalid or expired admin token")
+	}
+	return claims, nil
+}
+
+func verifySignedClaims(token string, secret []byte, now time.Time) (jwtClaims, error) {
 	parts := strings.Split(token, ".")
 	if len(parts) != 3 || len(secret) < 32 {
-		return "", errors.New("invalid token")
+		return jwtClaims{}, errors.New("invalid token")
 	}
 	headerBytes, err := base64.RawURLEncoding.DecodeString(parts[0])
 	if err != nil {
-		return "", errors.New("invalid token")
+		return jwtClaims{}, errors.New("invalid token")
 	}
 	var header map[string]string
 	if json.Unmarshal(headerBytes, &header) != nil || header["alg"] != "HS256" || header["typ"] != "JWT" {
-		return "", errors.New("invalid token")
+		return jwtClaims{}, errors.New("invalid token")
 	}
 	providedSignature, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
-		return "", errors.New("invalid token")
+		return jwtClaims{}, errors.New("invalid token")
 	}
 	mac := hmac.New(sha256.New, secret)
 	_, _ = mac.Write([]byte(parts[0] + "." + parts[1]))
 	if !hmac.Equal(providedSignature, mac.Sum(nil)) {
-		return "", errors.New("invalid token")
+		return jwtClaims{}, errors.New("invalid token")
 	}
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return "", errors.New("invalid token")
+		return jwtClaims{}, errors.New("invalid token")
 	}
 	var claims jwtClaims
-	if json.Unmarshal(payload, &claims) != nil ||
-		claims.Issuer != tokenIssuer ||
+	if json.Unmarshal(payload, &claims) != nil {
+		return jwtClaims{}, errors.New("invalid or expired token")
+	}
+	validLifetime := false
+	lifetime := claims.Expires - claims.Issued
+	if claims.Role != "" {
+		validLifetime = claims.Role == "admin" || claims.Role == "developer"
+		validLifetime = validLifetime && lifetime == int64(adminTokenLifetime.Seconds())
+	} else if claims.RememberMe {
+		validLifetime = lifetime == int64(rememberedTokenLifetime.Seconds())
+	} else {
+		validLifetime = lifetime == int64(tokenLifetime.Seconds()) ||
+			lifetime == int64(legacyTokenLifetime.Seconds())
+	}
+	if claims.Issuer != tokenIssuer ||
 		!validUUID(claims.Subject) ||
 		claims.Issued <= 0 ||
 		claims.Issued > now.Add(time.Minute).Unix() ||
 		claims.Expires <= now.Unix() ||
-		claims.Expires-claims.Issued != int64(tokenLifetime.Seconds()) {
-		return "", errors.New("invalid or expired token")
+		!validLifetime {
+		return jwtClaims{}, errors.New("invalid or expired token")
 	}
-	return claims.Subject, nil
+	return claims, nil
 }
 
 func safeFilePath(root, kind, filename string) (string, error) {

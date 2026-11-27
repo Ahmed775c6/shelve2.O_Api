@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"golang.org/x/crypto/bcrypt"
 )
 
 func (a *API) emailVerificationEnabled() bool {
@@ -50,6 +51,139 @@ func (a *API) sendVerificationEmail(ctx context.Context, address, name, token st
 		greeting, verificationURL.String(),
 	)
 	return a.cfg.mailer.Send(ctx, address, "Verify your Shelve email address", body)
+}
+
+func (a *API) sendPasswordResetEmail(ctx context.Context, address, name, token string) error {
+	if a.cfg.mailer == nil {
+		return errors.New("email delivery is not configured")
+	}
+	resetURL, err := url.Parse(a.cfg.verificationBaseURL)
+	if err != nil {
+		return errors.New("password reset URL is invalid")
+	}
+	resetURL.Path = strings.TrimRight(strings.TrimSuffix(strings.TrimRight(resetURL.Path, "/"), "/verify-email"), "/") + "/reset-password"
+	query := resetURL.Query()
+	query.Set("token", token)
+	resetURL.RawQuery = query.Encode()
+	greeting := "Hello,"
+	if name != "" {
+		greeting = "Hello " + name + ","
+	}
+	body := fmt.Sprintf(
+		"%s\n\nReset your Shelve password using this link:\n%s\n\nThis link expires in one hour. If you did not request a password reset, you can ignore this email.",
+		greeting, resetURL.String(),
+	)
+	return a.cfg.mailer.Send(ctx, address, "Reset your Shelve password", body)
+}
+
+func (a *API) forgotPassword(w http.ResponseWriter, r *http.Request) {
+	if !a.allowRate(r, 5, time.Hour) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many password reset requests")
+		return
+	}
+	var input struct{ Email string }
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	address := strings.ToLower(strings.TrimSpace(input.Email))
+	if !validEmail(address) {
+		writeError(w, http.StatusBadRequest, "invalid_email", "Provide a valid email address")
+		return
+	}
+	if a.cfg.mailer == nil || strings.TrimSpace(a.cfg.verificationBaseURL) == "" {
+		writeError(w, http.StatusServiceUnavailable, "email_unavailable", "Password recovery is not configured on this server")
+		return
+	}
+	var owner, name string
+	err := a.db.QueryRow(r.Context(),
+		`SELECT id::text,name FROM users WHERE LOWER(email)=LOWER($1)`, address).Scan(&owner, &name)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeJSON(w, http.StatusAccepted, map[string]string{"message": "If an account exists for that email, a password reset link has been sent."})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not request a password reset")
+		return
+	}
+	token, tokenHash, err := newVerificationToken()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not create a password reset token")
+		return
+	}
+	_, err = a.db.Exec(r.Context(),
+		`INSERT INTO password_reset_tokens(user_id,token_hash,expires_at,created_at)
+		 VALUES($1,$2,NOW()+INTERVAL '1 hour',NOW())
+		 ON CONFLICT(user_id) DO UPDATE SET token_hash=EXCLUDED.token_hash,
+		   expires_at=EXCLUDED.expires_at,created_at=EXCLUDED.created_at`,
+		owner, tokenHash)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not create a password reset token")
+		return
+	}
+	if err := a.sendPasswordResetEmail(r.Context(), address, name, token); err != nil {
+		log.Printf("password reset email delivery failed: %v", err)
+		writeError(w, http.StatusServiceUnavailable, "email_delivery_failed", "The password reset email could not be sent. Please try again later.")
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]string{"message": "If an account exists for that email, a password reset link has been sent."})
+}
+
+func (a *API) resetPassword(w http.ResponseWriter, r *http.Request) {
+	if !a.allowRate(r, 30, time.Minute) {
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many password reset attempts")
+		return
+	}
+	var input struct {
+		Token       string
+		NewPassword string
+	}
+	if !decodeJSON(w, r, &input) {
+		return
+	}
+	if len(input.Token) < 32 || len(input.Token) > 128 || len(input.NewPassword) < 8 || len(input.NewPassword) > 72 {
+		writeError(w, http.StatusBadRequest, "invalid_password_reset", "A valid reset link and a password of 8 to 72 bytes are required")
+		return
+	}
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(input.NewPassword), bcrypt.DefaultCost)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not update password")
+		return
+	}
+	tokenHash := sha256.Sum256([]byte(input.Token))
+	tx, err := a.db.Begin(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not reset password")
+		return
+	}
+	defer tx.Rollback(r.Context())
+	var owner string
+	err = tx.QueryRow(r.Context(),
+		`SELECT user_id::text FROM password_reset_tokens
+		 WHERE token_hash=$1 AND expires_at>NOW() FOR UPDATE`,
+		fmt.Sprintf("%x", tokenHash)).Scan(&owner)
+	if errors.Is(err, pgx.ErrNoRows) {
+		writeError(w, http.StatusBadRequest, "invalid_password_reset", "This password reset link is invalid or expired")
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not reset password")
+		return
+	}
+	if _, err := tx.Exec(r.Context(),
+		`UPDATE users SET password_hash=$1,updated_at=NOW() WHERE id=$2`,
+		string(passwordHash), owner); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not update password")
+		return
+	}
+	if _, err := tx.Exec(r.Context(), `DELETE FROM password_reset_tokens WHERE user_id=$1`, owner); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not complete password reset")
+		return
+	}
+	if err := tx.Commit(r.Context()); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal_error", "Could not complete password reset")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"changed": true})
 }
 
 func (a *API) verifyEmail(w http.ResponseWriter, r *http.Request) {

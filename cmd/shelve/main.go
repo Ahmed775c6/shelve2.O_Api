@@ -66,6 +66,10 @@ func main() {
 			Origins:             cfg.origins,
 			Mailer:              cfg.mailer,
 			VerificationBaseURL: cfg.verificationBaseURL,
+			AdminUsername:       cfg.adminUsername,
+			AdminPassword:       cfg.adminPassword,
+			DeveloperUsername:   cfg.developerUsername,
+			DeveloperPassword:   cfg.developerPassword,
 		}).Handler(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
@@ -131,12 +135,35 @@ type config struct {
 	origins             map[string]struct{}
 	mailer              mailer.Sender
 	verificationBaseURL string
+	adminUsername       string
+	adminPassword       string
+	developerUsername   string
+	developerPassword   string
 }
 
 func loadConfig() (config, error) {
 	secret := strings.TrimSpace(os.Getenv("JWT_SECRET"))
 	if len(secret) < 32 {
 		return config{}, errors.New("JWT_SECRET is required and must be at least 32 characters")
+	}
+	adminPassword := os.Getenv("ADMIN_PASSWORD")
+	if len(adminPassword) < 12 {
+		return config{}, errors.New("ADMIN_PASSWORD is required and must be at least 12 characters")
+	}
+	adminUsername := envOr("ADMIN_USERNAME", "Ahmed")
+	if strings.TrimSpace(adminUsername) == "" {
+		return config{}, errors.New("ADMIN_USERNAME cannot be empty")
+	}
+	developerUsername := strings.TrimSpace(os.Getenv("DEVELOPER_USERNAME"))
+	developerPassword := os.Getenv("DEVELOPER_PASSWORD")
+	if (developerUsername == "") != (developerPassword == "") {
+		return config{}, errors.New("DEVELOPER_USERNAME and DEVELOPER_PASSWORD must be configured together")
+	}
+	if developerPassword != "" && len(developerPassword) < 12 {
+		return config{}, errors.New("DEVELOPER_PASSWORD must be at least 12 characters")
+	}
+	if developerUsername != "" && strings.EqualFold(developerUsername, adminUsername) {
+		return config{}, errors.New("DEVELOPER_USERNAME must differ from ADMIN_USERNAME")
 	}
 	port := strings.TrimSpace(os.Getenv("PORT"))
 	if port == "" {
@@ -206,6 +233,10 @@ func loadConfig() (config, error) {
 		origins:             allowedOrigins,
 		mailer:              emailSender,
 		verificationBaseURL: verificationBaseURL,
+		adminUsername:       adminUsername,
+		adminPassword:       adminPassword,
+		developerUsername:   developerUsername,
+		developerPassword:   developerPassword,
 	}, nil
 }
 
